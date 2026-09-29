@@ -161,13 +161,27 @@
   .ew-net-pos { color: #c62828; }
   .ew-net-neg { color: #1565c0; }
   .flow-arrow { color: var(--muted); }
+
+  /* 可锁定标高 */
+  table.lock-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.lock-table th, table.lock-table td {
+    border-bottom: 1px solid var(--line);
+    padding: 6px 8px;
+    text-align: center;
+  }
+  table.lock-table th { color: var(--muted); font-weight: normal; font-size: 12px; }
+  td.lock-iv { font-variant-numeric: tabular-nums; letter-spacing: .3px; }
+  td.lock-iv .seg { color: var(--accent-dark); font-weight: 600; }
+  td.lock-iv .sep { color: var(--muted); margin: 0 6px; }
+  .lock-stat { font-size: 12px; color: var(--muted); }
+  .lock-stat b { color: var(--ink); font-weight: 600; }
   footer { text-align: center; color: var(--muted); font-size: 12px; margin-top: 8px; }
 </style>
 </head>
 <body>
 <header>
   <h1>步道坡线规划台</h1>
-  <p>测点等间距 1 m · 地面/方案标高 0～200 整数厘米 · 相邻高差 ≤ 8 cm · 任意连续 5 段至少 1 段水平 · 可行方案附土方调配核算</p>
+  <p>测点等间距 1 m · 地面/方案标高 0～200 整数厘米 · 相邻高差 ≤ 8 cm · 任意连续 5 段至少 1 段水平 · 逐点可锁定标高分析 · 可行方案附土方调配核算</p>
 </header>
 
 <main>
@@ -236,6 +250,19 @@
     </div>
   </section>
 
+  <section class="card" id="lockCard" hidden>
+    <h2>测点可锁定标高分析 <span class="tag">单独锁定某点方案标高、其他点自由选择（不限总调整量）时，仍能组成完整可行坡线的全部标高（cm）；区间为升序闭区间，相邻区间之间存在空档，不用最小/最大值填平</span></h2>
+    <div class="editor-wrap">
+      <table class="lock-table">
+        <thead>
+          <tr><th>测点</th><th>地面标高</th><th>可锁定标高区间（cm）</th><th>可锁值个数</th></tr>
+        </thead>
+        <tbody id="lockBody"></tbody>
+      </table>
+    </div>
+    <p class="hint">首、尾测点方案标高固定等于地面标高，故只有一个可锁定值；每个区间 <b>[a, b]</b> 含全部整数 a～b，两个不相邻区间之间的整数锁定后全线无解。该分析只依赖地面标高，与步道净宽无关。</p>
+  </section>
+
   <section class="card" id="earthworkCard" hidden>
     <h2>土方调配核算 <span class="tag">净宽 <b id="ewWidth">–</b> 米 · 每段土方集中于该段中点，同段挖填先抵消，余量沿相邻中点调配，全线余量只经起点进出</span></h2>
     <div class="summary">
@@ -273,7 +300,9 @@ const N_MIN = 3, N_MAX = 16, H_MIN = 0, H_MAX = 200;
 const W_MIN = 0.5, W_MAX = 10;
 let ground = [100, 107, 114, 119, 124, 130];
 let lastResult = null;
+let bannerMsg = null;        // {kind: "error"|"warn", html}
 let debounceTimer = null;
+let calcGeneration = 0;      // 每次重算自增，丢弃过期请求的回写
 
 const $ = (id) => document.getElementById(id);
 
@@ -361,57 +390,150 @@ function clientValidate() {
 }
 
 function showBanner(kind, html) {
-  const b = $("chartBanner");
-  b.className = "banner " + kind;
-  b.innerHTML = html;
+  // 同类原因只保留一条；错误优先于告警
+  if (!bannerMsg || kind === "error" || bannerMsg.kind === "warn") {
+    bannerMsg = { kind: kind, html: html };
+  }
+  renderBanner();
 }
 function clearBanner() {
+  bannerMsg = null;
+  renderBanner();
+}
+function renderBanner() {
   const b = $("chartBanner");
-  b.className = "banner";
-  b.textContent = "";
+  if (!bannerMsg) {
+    b.className = "banner";
+    b.textContent = "";
+    return;
+  }
+  b.className = "banner " + bannerMsg.kind;
+  const label = bannerMsg.kind === "error" ? "非法输入" : "无可行方案";
+  b.innerHTML = "<b>" + label + "：</b>" + bannerMsg.html;
+}
+
+function hideLockCard() {
+  $("lockCard").hidden = true;
+  $("lockBody").innerHTML = "";
 }
 
 async function calculate() {
   const err = clientValidate();
   const widthInfo = readWidth();
-  if (err || !widthInfo.ok) {
-    lastResult = null;
+
+  // 每次重算先清空旧的可锁定区间与提示，避免展示过期结果
+  clearBanner();
+  hideLockCard();
+  lastResult = null;
+  const gen = ++calcGeneration;
+
+  if (err) {
     $("resultCard").hidden = true;
     $("earthworkCard").hidden = true;
-    showBanner("error", "<b>非法输入：</b>" + escapeHtml(err || widthInfo.reason));
+    showBanner("error", escapeHtml(err));
     drawChart(null);
     return;
   }
-  try {
-    const resp = await fetch("/api/plan", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ground: ground, width: widthInfo.value })
-    });
-    const data = await resp.json();
-    if (resp.ok && data.feasible) {
-      lastResult = data;
-      clearBanner();
-      $("resultCard").hidden = false;
-      $("earthworkCard").hidden = false;
-      renderResult(data);
-      renderEarthwork(data.earthwork);
-      drawChart(data);
-    } else {
-      lastResult = null;
-      $("resultCard").hidden = true;
-      $("earthworkCard").hidden = true;
-      const reason = (data && data.reason) ? data.reason : "计算失败。";
-      showBanner("warn", "<b>无可行方案：</b>" + escapeHtml(reason));
-      drawChart(null);
+
+  // 可锁定分析只依赖地面标高：地面合法即并行请求，不受净宽影响
+  const lockReq = fetch("/api/lockable", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ground: ground })
+  }).then(async (resp) => {
+    const data = await resp.json().catch(() => null);
+    if (gen === calcGeneration) await refreshLockAnalysis(resp, data);
+  }).catch((e) => {
+    if (gen === calcGeneration) {
+      showBanner("error", "可锁定分析请求失败（" + escapeHtml(String(e)) + "）");
     }
-  } catch (e) {
-    lastResult = null;
+  });
+
+  if (!widthInfo.ok) {
     $("resultCard").hidden = true;
     $("earthworkCard").hidden = true;
-    showBanner("error", "<b>请求失败：</b>无法连接计算服务（" + escapeHtml(String(e)) + "）");
+    showBanner("error", escapeHtml(widthInfo.reason));
     drawChart(null);
+    await lockReq;
+    return;
   }
+
+  const planReq = (async () => {
+    let data;
+    try {
+      const resp = await fetch("/api/plan", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ground: ground, width: widthInfo.value })
+      });
+      data = await resp.json();
+      if (gen !== calcGeneration) return;
+      if (resp.ok && data.feasible) {
+        lastResult = data;
+        $("resultCard").hidden = false;
+        $("earthworkCard").hidden = false;
+        renderResult(data);
+        renderEarthwork(data.earthwork);
+        drawChart(data);
+      } else {
+        $("resultCard").hidden = true;
+        $("earthworkCard").hidden = true;
+        const reason = (data && data.reason) ? data.reason : "计算失败。";
+        showBanner("warn", escapeHtml(reason));
+        drawChart(null);
+      }
+    } catch (e) {
+      if (gen !== calcGeneration) return;
+      $("resultCard").hidden = true;
+      $("earthworkCard").hidden = true;
+      showBanner("error", "无法连接计算服务（" + escapeHtml(String(e)) + "）");
+      drawChart(null);
+    }
+  })();
+
+  await Promise.all([lockReq, planReq]);
+}
+
+async function refreshLockAnalysis(resp, data) {
+  // 非法输入或全线无解时清空旧区间并说明原因
+  if (!resp.ok || !data || data.feasible === false) {
+    hideLockCard();
+    if (data && data.reason) {
+      showBanner(resp.ok ? "warn" : "error",
+        "可锁定标高分析：" + escapeHtml(data.reason));
+    } else {
+      showBanner("error", "可锁定标高分析返回了无法解析的结果。");
+    }
+    return;
+  }
+  if (!Array.isArray(data.points) || data.points.length !== ground.length) {
+    hideLockCard();
+    showBanner("error", "可锁定标高分析结果与测点数量不一致。");
+    return;
+  }
+  $("lockCard").hidden = false;
+  renderLockable(data);
+}
+
+function formatIntervals(intervals) {
+  return intervals.map(([lo, hi]) => {
+    const text = lo === hi ? String(lo) : lo + "～" + hi;
+    return '<span class="seg">[' + text + "]</span>";
+  }).join('<span class="sep">/</span>');
+}
+
+function renderLockable(data) {
+  const body = $("lockBody");
+  body.innerHTML = "";
+  data.points.forEach((p, i) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML =
+      "<td>" + p.index + (p.fixed ? ' <span class="badge yes">首尾固定</span>' : "") + "</td>" +
+      "<td>" + data.ground[i] + "</td>" +
+      '<td class="lock-iv">' + formatIntervals(p.intervals) + "</td>" +
+      "<td>" + p.values.length + "</td>";
+    body.appendChild(tr);
+  });
 }
 
 function escapeHtml(s) {

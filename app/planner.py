@@ -213,3 +213,156 @@ def plan_trail(ground: List[int]) -> dict:
         "segments": segments,
         "horizontal_indices": horizontal_indices,
     }
+
+
+# ---------------------------------------------------------------------------
+# 测点可锁定标高分析
+#
+# 对每个测点 i 单独提问：把方案标高 plan[i] 锁定为 h，其他点自由选择（不限
+# 总调整量），是否仍存在一条满足全部规则的完整坡线？
+#
+# 做法：分别求前向、后向“可行性”状态（与代价无关，只看可达性）。
+#   fwd[pos][mask] 为一个 201 位的位集（bit h 置位）：第 pos 点取 h、此前
+#       最近 4 段（不足时以虚拟水平段填充）水平掩码为 mask 时，是否存在
+#       合法前缀 plan[0..pos]；
+#   bwd[pos][mask] 同为位集：第 pos 点取 h、此前 4 段掩码为 mask 时，是否
+#       存在合法后缀 plan[pos..n-1]。
+# 则锁定 (pos, h) 可行 ⇔ 存在 mask 使该状态在前向、后向均可达。转移规则与
+# plan_trail 完全一致，只是把最小代价换成布尔可达，天然复用同一套校验。
+# ---------------------------------------------------------------------------
+
+def _fwd_step(prev, pos):
+    """前向转移：prev 为到达 pos-1 点的位集层，返回到达 pos 点的层。"""
+    layer = [0] * (1 << RECENT)
+    check_window = (pos - 1) >= WINDOW - 1
+    for pmask in range(1 << RECENT):
+        bits = prev[pmask]
+        if bits == 0:
+            continue
+        # 水平段：新掩码低位补 1，标高不变
+        nmask = 1 | ((pmask << 1) & _MASK_RECENT)
+        if not check_window or _window_mask(pmask, 1) != 0:
+            layer[nmask] |= bits
+        # 非水平段：新掩码低位补 0，新标高与旧标高相距 1～8
+        if not check_window or _window_mask(pmask, 0) != 0:
+            nmask = (pmask << 1) & _MASK_RECENT
+            layer[nmask] |= _sloped_targets(bits)
+    return layer
+
+
+def _bwd_step(nxt, seg_index):
+    """后向转移：nxt 为 seg_index+1 点的位集层，返回 seg_index 点的层。
+
+    直接枚举前掩码 ``pmask``（与前向转移同一套掩码语义），由后点位集
+    反推前点可达标高：水平段 ``h == nh``；非水平段 ``|h - nh| ∈ 1..8``。
+    """
+    layer = [0] * (1 << RECENT)
+    check_window = seg_index >= WINDOW - 1
+    for pmask in range(1 << RECENT):
+        # 水平段：后点掩码低位为 1，h == nh
+        nmask_h = 1 | ((pmask << 1) & _MASK_RECENT)
+        if not check_window or _window_mask(pmask, 1) != 0:
+            layer[pmask] |= nxt[nmask_h]
+        # 非水平段：后点掩码低位为 0
+        nmask_s = (pmask << 1) & _MASK_RECENT
+        if not check_window or _window_mask(pmask, 0) != 0:
+            layer[pmask] |= _sloped_targets(nxt[nmask_s])
+    return layer
+
+
+def _sloped_targets(bits):
+    """位集沿标高轴膨胀 ±1～±8 并排除等高位（截断到 0～200）。
+
+    用于非水平段转移：源标高集合 ``bits`` 中每个置位标高 ``h`` 贡献目标
+    标高 ``h-8..h-1`` 与 ``h+1..h+8``；对整个位集做移位再按位或即可。
+    """
+    if bits == 0:
+        return 0
+    domain = (1 << (H_MAX + 1)) - 1
+    spread = 0
+    acc = bits
+    for _ in range(MAX_GRADE):
+        acc <<= 1
+        spread |= acc
+    acc = bits
+    for _ in range(MAX_GRADE):
+        acc >>= 1
+        spread |= acc
+    return (spread & domain) & ~bits
+
+
+def _compress_intervals(values):
+    """把升序整数集合压缩为“互不相邻”的升序闭区间 [lo, hi] 列表。
+
+    只合并相邻整数（hi + 1 == lo），不以最小/最大值填平中间空档。
+    """
+    intervals = []
+    for h in values:
+        if intervals and h == intervals[-1][1] + 1:
+            intervals[-1][1] = h
+        else:
+            intervals.append([h, h])
+    return intervals
+
+
+def lockable_heights(ground: List[int]) -> dict:
+    """逐点求“单独锁定该点时仍可组成完整可行坡线”的标高集合。
+
+    与最优性无关：不限制总调整量，也不要求与 :func:`plan_trail` 的最优
+    方案一致。可行时返回::
+
+        {
+          "feasible": True,
+          "ground": [...],
+          "points": [
+            {"index": 1, "fixed": True,
+             "values": [g0], "intervals": [[g0, g0]]},
+            {"index": 2, "fixed": False,
+             "values": [...], "intervals": [[lo, hi], ...]},
+            ...
+          ],
+        }
+
+    首、尾点方案标高固定等于地面标高，其可锁定集合恒为单值。
+    全线无解时返回 ``{"feasible": False, "reason": ...}``；非法输入抛
+    :class:`PlanError`（与 :func:`plan_trail` 同一套校验）。
+    """
+    _validate(ground)
+    n = len(ground)
+    g0, glast = ground[0], ground[-1]
+
+    # 前向可达：起点唯一状态（虚拟前 4 段全水平 = 0b1111，标高 g0）。
+    fwd = [[0] * (1 << RECENT) for _ in range(n)]
+    fwd[0][_MASK_RECENT] = 1 << g0
+    for pos in range(1, n):
+        fwd[pos] = _fwd_step(fwd[pos - 1], pos)
+
+    # 后向可达：终点任意到达掩码（0..0b1111）下标高 glast 均视为可收尾。
+    bwd = [[0] * (1 << RECENT) for _ in range(n)]
+    for mask in range(1 << RECENT):
+        bwd[n - 1][mask] = 1 << glast
+    for seg_index in range(n - 2, -1, -1):
+        bwd[seg_index] = _bwd_step(bwd[seg_index + 1], seg_index)
+
+    # 全线可行 ⇔ 终点在固定标高 glast 上前后可达状态有交集（掩码由前缀唯一
+    # 确定，后向对所有到达掩码都允许收尾）。
+    end_reachable = any(
+        fwd[n - 1][mask] & bwd[n - 1][mask] for mask in range(1 << RECENT)
+    )
+    if not end_reachable:
+        return {"feasible": False, "reason": _infeasible_reason(ground)}
+
+    points = []
+    for pos in range(n):
+        joined = 0
+        for mask in range(1 << RECENT):
+            joined |= fwd[pos][mask] & bwd[pos][mask]
+        values = [h for h in range(H_MIN, H_MAX + 1) if (joined >> h) & 1]
+        points.append({
+            "index": pos + 1,
+            "fixed": pos == 0 or pos == n - 1,
+            "values": values,
+            "intervals": _compress_intervals(values),
+        })
+
+    return {"feasible": True, "ground": list(ground), "points": points}

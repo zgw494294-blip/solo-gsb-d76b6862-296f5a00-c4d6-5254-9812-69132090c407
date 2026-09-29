@@ -9,11 +9,11 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .earthwork import plan_with_earthwork
-from .planner import PlanError
+from .planner import PlanError, lockable_heights
 
 BASE_DIR = Path(__file__).resolve().parent
 
-app = FastAPI(title="步道坡线规划台", version="1.1.0")
+app = FastAPI(title="步道坡线规划台", version="1.2.0")
 
 
 def _error(message: str, status: int = 422) -> JSONResponse:
@@ -37,6 +37,20 @@ async def api_plan(request: Request) -> JSONResponse:
         return _error("请求 JSON 必须包含 width 字段（步道净宽，单位米）。", status=400)
 
     result = plan_with_earthwork(payload["ground"], payload["width"])
+    return JSONResponse(status_code=200, content=result)
+
+
+@app.post("/api/lockable")
+async def api_lockable(request: Request) -> JSONResponse:
+    """测点可锁定标高分析：只接收地面标高数组，复用同一套输入校验。"""
+    try:
+        payload = await request.json()
+    except Exception:
+        return _error("请求体必须是合法的 JSON。", status=400)
+    if not isinstance(payload, dict) or "ground" not in payload:
+        return _error("请求 JSON 必须包含 ground 字段（地面标高数组）。", status=400)
+
+    result = lockable_heights(payload["ground"])
     return JSONResponse(status_code=200, content=result)
 
 

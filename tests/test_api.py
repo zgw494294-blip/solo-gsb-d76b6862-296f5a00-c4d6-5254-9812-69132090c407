@@ -120,3 +120,77 @@ def test_index_page():
     assert resp.status_code == 200
     assert "步道坡线规划台".encode() in resp.content
     assert "步道净宽".encode() in resp.content
+
+
+# ---------- /api/lockable ----------
+
+def test_lockable_ok():
+    resp = client.post("/api/lockable", json={"ground": [100, 107, 114, 119, 124, 130]})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["feasible"] is True
+    assert len(data["points"]) == 6
+    first, last = data["points"][0], data["points"][-1]
+    assert first["fixed"] and first["values"] == [100]
+    assert first["intervals"] == [[100, 100]]
+    assert last["fixed"] and last["values"] == [130]
+    # 测点 2：100 与 106～108 两段，空档 101～105 不得填平
+    p2 = data["points"][1]
+    assert p2["fixed"] is False
+    assert p2["values"] == [100, 106, 107, 108]
+    assert p2["intervals"] == [[100, 100], [106, 108]]
+
+
+def test_lockable_needs_only_ground():
+    # 不传 width 也能调用
+    resp = client.post("/api/lockable", json={"ground": [100, 100, 100]})
+    assert resp.status_code == 200
+    assert resp.json()["feasible"] is True
+
+
+def test_lockable_invalid_count():
+    resp = client.post("/api/lockable", json={"ground": [1, 2]})
+    assert resp.status_code == 422
+    data = resp.json()
+    assert data["feasible"] is False
+    assert "3" in data["reason"]
+
+
+def test_lockable_invalid_range():
+    resp = client.post("/api/lockable", json={"ground": [0, 999, 0]})
+    assert resp.status_code == 422
+    assert "超出范围" in resp.json()["reason"]
+
+
+def test_lockable_reject_float_and_bool():
+    for bad in ([0, 1.5, 0], [0, True, 0]):
+        resp = client.post("/api/lockable", json={"ground": bad})
+        assert resp.status_code == 422
+        assert "整数" in resp.json()["reason"]
+
+
+def test_lockable_missing_ground():
+    resp = client.post("/api/lockable", json={"points": [1, 2, 3]})
+    assert resp.status_code == 400
+    assert "ground" in resp.json()["reason"]
+
+
+def test_lockable_body_not_json():
+    resp = client.post("/api/lockable", content="not-json",
+                       headers={"Content-Type": "text/plain"})
+    assert resp.status_code == 400
+
+
+def test_lockable_infeasible_is_200():
+    resp = client.post("/api/lockable", json={"ground": [0, 8, 16, 24, 32, 40]})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["feasible"] is False
+    assert "无解" in data["reason"]
+    assert "points" not in data
+
+
+def test_index_page_mentions_lock_analysis():
+    resp = client.get("/")
+    assert "可锁定".encode() in resp.content
+    assert "/api/lockable".encode() in resp.content
