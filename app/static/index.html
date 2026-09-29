@@ -222,7 +222,7 @@
       <div>
         <p class="sub-title">各点标高（cm）</p>
         <table class="data">
-          <thead><tr><th>测点</th><th>地面标高</th><th>方案标高</th><th>|差值|</th></tr></thead>
+          <thead><tr><th>测点</th><th>地面标高</th><th>方案标高</th><th>|差值|</th><th>可锁定区间</th></tr></thead>
           <tbody id="pointBody"></tbody>
         </table>
       </div>
@@ -234,6 +234,7 @@
         </table>
       </div>
     </div>
+    <p class="hint">可锁定区间：单独把该测点方案标高锁定为区间内任意整数厘米时，其余测点仍能补全为满足全部规则的完整坡线（不限总调整量，也不要求与当前最优方案一致）；区间外的值均不可行。首尾测点方案标高固定等于地面标高。</p>
   </section>
 
   <section class="card" id="earthworkCard" hidden>
@@ -273,7 +274,9 @@ const N_MIN = 3, N_MAX = 16, H_MIN = 0, H_MAX = 200;
 const W_MIN = 0.5, W_MAX = 10;
 let ground = [100, 107, 114, 119, 124, 130];
 let lastResult = null;
+let lastLockable = null;
 let debounceTimer = null;
+let calcSeq = 0;
 
 const $ = (id) => document.getElementById(id);
 
@@ -372,10 +375,12 @@ function clearBanner() {
 }
 
 async function calculate() {
+  const seq = ++calcSeq;
   const err = clientValidate();
   const widthInfo = readWidth();
   if (err || !widthInfo.ok) {
     lastResult = null;
+    lastLockable = null;
     $("resultCard").hidden = true;
     $("earthworkCard").hidden = true;
     showBanner("error", "<b>非法输入：</b>" + escapeHtml(err || widthInfo.reason));
@@ -383,22 +388,32 @@ async function calculate() {
     return;
   }
   try {
+    // 可锁定区间分析与方案计算并发请求；区间请求失败不影响方案展示。
+    const lockPromise = fetch("/api/lockable", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ground: ground })
+    }).then(r => r.json()).catch(() => null);
     const resp = await fetch("/api/plan", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ ground: ground, width: widthInfo.value })
     });
     const data = await resp.json();
+    const lockData = await lockPromise;
+    if (seq !== calcSeq) return;   // 已有更新的输入，丢弃过期响应
     if (resp.ok && data.feasible) {
       lastResult = data;
+      lastLockable = (lockData && lockData.feasible) ? lockData : null;
       clearBanner();
       $("resultCard").hidden = false;
       $("earthworkCard").hidden = false;
-      renderResult(data);
+      renderResult(data, lastLockable);
       renderEarthwork(data.earthwork);
       drawChart(data);
     } else {
       lastResult = null;
+      lastLockable = null;
       $("resultCard").hidden = true;
       $("earthworkCard").hidden = true;
       const reason = (data && data.reason) ? data.reason : "计算失败。";
@@ -406,7 +421,9 @@ async function calculate() {
       drawChart(null);
     }
   } catch (e) {
+    if (seq !== calcSeq) return;
     lastResult = null;
+    lastLockable = null;
     $("resultCard").hidden = true;
     $("earthworkCard").hidden = true;
     showBanner("error", "<b>请求失败：</b>无法连接计算服务（" + escapeHtml(String(e)) + "）");
@@ -419,7 +436,13 @@ function escapeHtml(s) {
     ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
 }
 
-function renderResult(r) {
+function fmtIntervals(intervals) {
+  return intervals.map(function (iv) {
+    return iv[0] === iv[1] ? String(iv[0]) : iv[0] + "～" + iv[1];
+  }).join("、");
+}
+
+function renderResult(r, lockable) {
   $("sumAdjust").textContent = r.total_adjustment;
   $("horizCount").textContent = r.horizontal_indices.length;
   let maxDelta = 0;
@@ -431,11 +454,15 @@ function renderResult(r) {
   r.plan.forEach((p, i) => {
     const tr = document.createElement("tr");
     const diff = Math.abs(p - r.ground[i]);
+    const pt = lockable && lockable.points ? lockable.points[i] : null;
+    const lockCell = pt && pt.intervals && pt.intervals.length
+      ? fmtIntervals(pt.intervals) : "—";
     tr.innerHTML =
       "<td>" + (i + 1) + "</td>" +
       "<td>" + r.ground[i] + "</td>" +
       "<td><b>" + p + "</b></td>" +
-      "<td>" + diff + "</td>";
+      "<td>" + diff + "</td>" +
+      "<td>" + lockCell + "</td>";
     pb.appendChild(tr);
   });
 
